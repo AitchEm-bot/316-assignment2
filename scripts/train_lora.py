@@ -1,9 +1,9 @@
 """
-CSCI316 Project 2 — Strategy 1: Full Fine-Tuning (All 1.3B Parameters)
-Uses DeepSpeed ZeRO Stage 2 + CPU Offloading to fit on 16 GB GPU.
+CSCI316 Project 2 — Strategy 2: LoRA (PEFT) Fine-Tuning
+Low-Rank Adaptation — trains ~0.5% of parameters.
 
-Run:  deepspeed scripts/train_full_finetune.py
-  OR: python scripts/train_full_finetune.py  (falls back to standard Trainer)
+Run:  python scripts/train_lora.py
+  OR: deepspeed scripts/train_lora.py
 """
 import sys
 import os
@@ -29,6 +29,7 @@ from transformers import (
     Trainer,
     EarlyStoppingCallback,
 )
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 from sklearn.metrics import classification_report, confusion_matrix
 
 from configs.config import *
@@ -37,28 +38,24 @@ from scripts.dataset import ArabicSentimentDataset
 
 set_seed(SEED)
 
-# ============================================================
-# Compatibility patch for Jais custom code
-# ============================================================
+# Compatibility patch
 import transformers.pytorch_utils as _pu
 if not hasattr(_pu, "find_pruneable_heads_and_indices"):
     try:
         from transformers.utils import find_pruneable_heads_and_indices
         _pu.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
-        print("Applied compatibility patch for find_pruneable_heads_and_indices")
     except ImportError:
-        print("Warning: Could not patch. Ensure transformers<=4.44.0")
+        pass
 
 
 def main():
     print("=" * 60)
-    print("STRATEGY 1: Progressive Layer Unfreezing")
+    print("STRATEGY 2: LoRA (PEFT) Fine-Tuning")
     print("=" * 60)
 
     # ----------------------------------------------------------
     # 1. Load tokenizer and data
     # ----------------------------------------------------------
-    print(f"\nLoading tokenizer from {MODEL_NAME}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -67,16 +64,15 @@ def main():
     train_df = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
     val_df = pd.read_csv(os.path.join(DATA_DIR, "val.csv"))
     test_df = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
-    print(f"Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
 
     train_dataset = ArabicSentimentDataset(train_df, tokenizer, MAX_LENGTH)
     val_dataset = ArabicSentimentDataset(val_df, tokenizer, MAX_LENGTH)
     test_dataset = ArabicSentimentDataset(test_df, tokenizer, MAX_LENGTH)
 
     # ----------------------------------------------------------
-    # 2. Load model — ALL parameters trainable
+    # 2. Load model + apply LoRA
     # ----------------------------------------------------------
-    print(f"\nLoading {MODEL_NAME} (fp32, all params trainable)...")
+    print(f"\nLoading {MODEL_NAME} for LoRA...")
     model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME,
         num_labels=NUM_LABELS,
@@ -85,77 +81,54 @@ def main():
         ignore_mismatched_sizes=True,
     )
     model.config.pad_token_id = tokenizer.pad_token_id
-    # Without DeepSpeed, freeze early layers to fit in 16 GB VRAM
-    for param in model.parameters():
-        param.requires_grad = False
 
-    UNFREEZE_LAST_N = 6
-    total_layers = 24
-    for name, param in model.named_parameters():
-        if 'score' in name or 'ln_f' in name:
-            param.requires_grad = True
-        else:
-            for layer_idx in range(total_layers - UNFREEZE_LAST_N, total_layers):
-                if f'.h.{layer_idx}.' in name or f'.layers.{layer_idx}.' in name:
-                    param.requires_grad = True
-                    break
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters:     {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
-
-    # ----------------------------------------------------------
-    # 3. Sanity check (20 steps)
-    # ----------------------------------------------------------
-    print("\nRunning sanity check (20 steps)...")
-    sanity_args = TrainingArguments(
-        output_dir=os.path.join(CHECKPOINT_DIR, "sanity_check"),
-        max_steps=20,
-        per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        learning_rate=LEARNING_RATE,
-        fp16=True,
-        logging_steps=5,
-        report_to="none",
-        seed=SEED,
-        save_strategy="no",
+    lora_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        r=LORA_RANK,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules=["c_attn", "c_proj", "c_fc", "c_fc2"],
+        bias="none",
+        modules_to_save=["score"],
     )
-    sanity_trainer = Trainer(
-        model=model, args=sanity_args, train_dataset=train_dataset
-    )
-    result = sanity_trainer.train()
-    print(f"Sanity check loss: {result.training_loss:.4f}")
-    if result.training_loss < 0.01:
-        print("FAIL — loss is zero. Check setup.")
-        return
-    print("PASS — model is learning!\n")
-    del sanity_trainer
-    torch.cuda.empty_cache()
+
+    model = get_peft_model(model, lora_config)
+
+    lora_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    lora_total = sum(p.numel() for p in model.parameters())
+
+    print(f"\nLoRA Configuration:")
+    print(f"  Rank (r):     {LORA_RANK}")
+    print(f"  Alpha:        {LORA_ALPHA}")
+    print(f"  Dropout:      {LORA_DROPOUT}")
+    print(f"  Target:       q_proj, v_proj, k_proj, o_proj")
+    print(f"  Trainable:    {lora_trainable:,} ({lora_trainable / lora_total * 100:.4f}%)")
+    model.print_trainable_parameters()
 
     # ----------------------------------------------------------
-    # 4. Full training
+    # 3. Train
     # ----------------------------------------------------------
-    full_ft_dir = os.path.join(CHECKPOINT_DIR, "full_finetune")
-    os.makedirs(full_ft_dir, exist_ok=True)
+    lora_dir = os.path.join(CHECKPOINT_DIR, "lora_finetune")
+    os.makedirs(lora_dir, exist_ok=True)
 
     training_args = TrainingArguments(
-        output_dir=full_ft_dir,
+        output_dir=lora_dir,
         num_train_epochs=NUM_EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        learning_rate=LEARNING_RATE,
+        learning_rate=LEARNING_RATE * 5,  # LoRA benefits from higher LR
         weight_decay=WEIGHT_DECAY,
         warmup_ratio=WARMUP_RATIO,
         fp16=True,
+        gradient_checkpointing=False,
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         greater_is_better=True,
         save_total_limit=2,
-        gradient_checkpointing=True,  # Safe with fp32 master weights
-        logging_dir=os.path.join(full_ft_dir, "logs"),
+        logging_dir=os.path.join(lora_dir, "logs"),
         logging_steps=50,
         report_to="none",
         seed=SEED,
@@ -173,17 +146,18 @@ def main():
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
     )
 
-    # Resume from checkpoint if available
-    checkpoints = glob.glob(os.path.join(full_ft_dir, "checkpoint-*"))
+    # Resume
+    checkpoints = glob.glob(os.path.join(lora_dir, "checkpoint-*"))
     resume_from = max(checkpoints, key=os.path.getctime) if checkpoints else None
     if resume_from:
         print(f"Resuming from {resume_from}")
 
-    print("=" * 60)
-    print("STARTING FULL FINE-TUNING")
-    print(f"Training {trainable_params:,} parameters")
-    print("=" * 60)
+    print(f"\n{'=' * 60}")
+    print(f"STARTING LoRA FINE-TUNING")
+    print(f"Training {lora_trainable:,} parameters ({lora_trainable / lora_total * 100:.4f}%)")
+    print(f"{'=' * 60}")
 
+    torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
     train_result = trainer.train(resume_from_checkpoint=resume_from)
     ft_time = time.time() - start_time
@@ -194,7 +168,7 @@ def main():
     print(f"Peak GPU memory: {ft_memory:.2f} GB")
 
     # ----------------------------------------------------------
-    # 5. Evaluate on test set
+    # 4. Evaluate
     # ----------------------------------------------------------
     print("\nEvaluating on test set...")
     eval_results = trainer.evaluate(test_dataset)
@@ -203,7 +177,7 @@ def main():
     labels = predictions.label_ids
 
     print(f"\n{'=' * 60}")
-    print("FULL FINE-TUNING — TEST RESULTS")
+    print("LoRA — TEST RESULTS")
     print(f"{'=' * 60}")
     for k, v in eval_results.items():
         if "eval_" in k:
@@ -212,24 +186,22 @@ def main():
     print(f"\n{classification_report(labels, preds, target_names=[LABEL_MAP[i] for i in range(NUM_LABELS)])}")
 
     # Save model
-    model_path = os.path.join(CHECKPOINT_DIR, "jais_full_finetune_best")
-    trainer.save_model(model_path)
+    model_path = os.path.join(CHECKPOINT_DIR, "jais_lora_best")
+    model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
-    print(f"Model saved to {model_path}")
 
     # Confusion matrix
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Oranges",
                 xticklabels=[LABEL_MAP[i] for i in range(NUM_LABELS)],
                 yticklabels=[LABEL_MAP[i] for i in range(NUM_LABELS)], ax=ax)
-    ax.set_title("Confusion Matrix — Full Fine-Tuning", fontsize=14, fontweight="bold")
+    ax.set_title("Confusion Matrix — LoRA", fontsize=14, fontweight="bold")
     ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "confusion_matrix_full_ft.png"), dpi=150)
-    print(f"Confusion matrix saved to {RESULTS_DIR}/")
+    plt.savefig(os.path.join(RESULTS_DIR, "confusion_matrix_lora.png"), dpi=150)
 
-    # Save results JSON
+    # Save results
     results = {
         "accuracy": eval_results.get("eval_accuracy", 0),
         "f1": eval_results.get("eval_f1", 0),
@@ -237,15 +209,17 @@ def main():
         "recall": eval_results.get("eval_recall", 0),
         "training_time_seconds": ft_time,
         "peak_gpu_memory_gb": ft_memory,
-        "total_params": total_params,
-        "trainable_params": trainable_params,
-        "trainable_percent": trainable_params / total_params * 100,
-        "strategy": "Progressive Layer Unfreezing (last 6/24 layers)",
+        "total_params": lora_total,
+        "trainable_params": lora_trainable,
+        "trainable_percent": lora_trainable / lora_total * 100,
+        "lora_rank": LORA_RANK,
+        "lora_alpha": LORA_ALPHA,
+        "strategy": "LoRA (PEFT)",
     }
-    with open(os.path.join(RESULTS_DIR, "full_ft_results.json"), "w") as f:
+    with open(os.path.join(RESULTS_DIR, "lora_ft_results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    print("\n✓ Full fine-tuning complete!")
+    print("\n✓ LoRA fine-tuning complete!")
 
 
 if __name__ == "__main__":
