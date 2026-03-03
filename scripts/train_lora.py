@@ -87,7 +87,11 @@ def main():
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
+<<<<<<< HEAD
         target_modules=["c_attn", "c_proj", "c_fc", "c_fc2"],
+=======
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+>>>>>>> 255e40a8aee9159c4d2b7b928873ac6f1c7d0bcc
         bias="none",
         modules_to_save=["score"],
     )
