@@ -235,6 +235,9 @@ The **Dialectal Sentiment Fidelity Score** evaluates model understanding across 
 - DeepSpeed ZeRO: [Rajbhandari et al., 2020](https://arxiv.org/abs/1910.02054) — *ZeRO: Memory Optimizations Toward Training Trillion Parameter Models*
 - XLM-RoBERTa: [Conneau et al., 2020](https://arxiv.org/abs/1911.02116) — *Unsupervised Cross-lingual Representation Learning at Scale*
 
+## Appendix
+
+The model was uploaded on HuggingFace as well [ziyanhashim/jais-lora-gulf-arabic-sentiment](https://huggingface.co/ziyanhashim/jais-lora-gulf-arabic-sentiment)
 ## License
 
 Academic use only — CSCI316 Winter Session 2026, UOWD.
